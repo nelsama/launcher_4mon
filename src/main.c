@@ -436,6 +436,10 @@ void launch_app(app_entry_t* app) {
 
     rom_delay_ms(200);
 
+    /* Apagar el display ANTES de cargar: una vez que rom_mfs_load_run
+     * sobrescribe el launcher en $0800, ya no podemos usar el TM1638. */
+    tm1638_clear_display();
+
     /* rom_mfs_load_run carga el archivo a la direccion y salta a ella.
      * ZP: $F4-$F5 = name ptr, $F6-$F7 = addr */
     rom_mfs_load_run(app->name, LOAD_ADDR);

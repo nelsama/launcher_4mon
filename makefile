@@ -8,6 +8,11 @@
 #   make map    - Ver mapa de memoria
 # ============================================================================
 
+# Fuerza cmd.exe como shell en Windows (funciona desde PowerShell, CMD o Git Bash)
+ifeq ($(OS),Windows_NT)
+SHELL := cmd.exe
+endif
+
 # Configuración CC65 - Ajustar ruta si es necesario
 CC65_HOME = D:\cc65
 
