@@ -59,15 +59,71 @@ LAUNCHER/
 │   └── programa.cfg    # Configuración del linker
 ├── include/
 │   ├── romapi.h        # ROM API del Monitor 6502 (sin modificar)
-│   └── tm1638.h        # Librería TM1638 v2.0
-├── lib/tm1638/
-│   └── tm1638.c        # Driver TM1638
+│   └── tm1638.h        # Compatibilidad: redirige a la librería externa
+├── lib/                # (sin librerías copiadas; el TM1638 es externo)
 ├── build/              # Objetos (generados)
 ├── output/
 │   └── LAUNCHER.bin    # ✅ Binario final (~9.9 KB)
 ├── makefile            # Compilación
 └── README.md           # Este documento
 ```
+
+## 📦 Librería TM1638 (referenciada, no copiada)
+
+El driver TM1638 vive en su propio repositorio y **este proyecto solo lo
+referencia**, sin copiar código:
+
+```
+D:\Proyectos\libs\tm1638-6502-cc65
+├── src/tm1638.c        # Implementación
+├── include/tm1638.h    # Header público
+└── docs/, tests/, examples/
+```
+
+El `makefile` apunta ahí con `TM1638_DIR`, compila
+`$(TM1638_DIR)\src\tm1638.c` y añade `$(TM1638_DIR)\include` a `-I`. La ruta
+está en una sola variable, cámbiala ahí si mueves la librería.
+
+**Ventajas:**
+
+- Una sola copia del driver para todos los proyectos: se actualiza con
+  `git pull` en el repositorio de la librería.
+- El repositorio de la librería trae `docs/`, `examples/` y un banco de
+  pruebas (`make test`, requiere `sim65`).
+- `include/tm1638.h` de este proyecto queda como puente de compatibilidad:
+  redirige a la librería. **No contiene declaraciones**, así que nunca se
+  desincroniza del driver.
+
+**Cómo se resuelve el `#include`.** El orden de los `-I` importa y está
+deliberado: `$(TM1638_DIR)\include` va **antes** de `include`.
+
+1. `-I src` → no está
+2. `-I $(TM1638_DIR)\include` → encuentra el header real de la librería ✅
+
+Por eso `include/tm1638.h` de este proyecto **nunca se compila**: solo existe
+como puente para el código de la aplicación (`#include "tm1638.h"`), que así
+no necesita saber dónde vive la librería. `tm1638.c` tampoco pasa por ningún
+puente: se incluye a sí mismo con `"../include/tm1638.h"`.
+
+⚠️ **No inviertas el orden de esos dos `-I`.** Si `include` fuera primero,
+CC65 encontraría el puente, y su `#include "tm1638.h"` no continuaría al
+siguiente directorio: las guardas se llaman distinto, así que el header real
+nunca se incluiría y aparecería *Call to undeclared function
+'tm1638_show_text'*. El puente está protegido con una guarda de nombre
+distinto (`TM1638_BRIDGE_OMITIDO_AL_COMPILAR`) precisamente para eso: si algún
+día se incluye, la guarda no colisiona con `TM1638_H` y el error es explícito
+en vez de silencioso.
+
+**Nota:** al apuntar a una ruta absoluta, el proyecto no compila en otra
+máquina sin editar `TM1638_DIR`. Si necesitas portabilidad, la alternativa es
+un submódulo de Git:
+
+```bash
+git submodule add <url-del-repo> lib/tm1638
+git submodule update --init --recursive
+```
+
+y dejar `TM1638_DIR = lib\tm1638`.
 
 ## 🔧 Compilación
 
@@ -132,4 +188,6 @@ Usa `rom_mfs_load_run(name, 0x0800)` que carga el binario directamente en `$0800
 - La SD debe estar formateada con **MFS** (MicroFS), el sistema de archivos del Monitor 6502
 - Los binarios deben ser ejecutables desde `$0800` (formato estándar del monitor)
 - `romapi.h` **no ha sido modificado** — se usa tal cual
-- Para agregar más librerías, ver `include/romapi.h` para la ROM API y `lib/tm1638/` para el driver TM1638
+- Para agregar más librerías, ver `include/romapi.h` para la ROM API
+- El driver TM1638 **no se copia** en este proyecto: se referencia desde
+  `D:\Proyectos\libs\tm1638-6502-cc65` (ver sección Librería TM1638)

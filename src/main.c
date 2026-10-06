@@ -42,17 +42,32 @@
 #include <stdint.h>
 #include "romapi.h"
 #include "tm1638.h"
+#include "console.h"
 
 
 /* ============================================================================
  * CONSTANTES
  * ============================================================================ */
 
-#define MAX_APPS            60      /* Máximo número de aplicaciones listables */
+/* Maximo de aplicaciones listables.
+ *
+ * apps[] ocupa MAX_APPS * sizeof(app_entry_t) = MAX_APPS * 15 bytes.
+ * El MFS del monitor cachea el directorio en $0264 con FAT_ENTRIES = 16
+ * entradas, asi que no tiene sentido reservar para mas.
+ *
+ * Con 16: 16 * 15 = 240 bytes, que caben en el stack de 256 del programa.
+ * Con 60 (valor anterior) eran 900 bytes y desbordaba el stack en ~650,
+ * corrompiendo codigo y datos (el sintoma del ": " convertido en "NI"). */
+#define MAX_APPS            16      /* = FAT_ENTRIES: el MFS solo cachea 16 */
 #define APP_NAME_LEN        13      /* name(12) + null + margen */
 #define LOAD_ADDR           0x0800  /* Dirección de carga de los binarios */
 /* El buffer temporal ya no es necesario: rom_mfs_load_run()
  * carga el archivo directamente en $0800 sobrescribiendonos. */
+
+/* Separadores de 40 columnas: coinciden EXACTAMENTE con CONSOLE_COLS.
+ * Un caracter de mas hace que la pantalla envuelva y deje una linea huerfana. */
+#define SEP_EQ  "========================================"   /* 40 '=' */
+#define SEP_DA  "----------------------------------------"   /* 40 '-' */
 
 /* TM1638 key mapping */
 #define TM_KEY_UP           1       /* S1 - Subir */
@@ -93,6 +108,26 @@ void uart_print(const char *s) {
 }
 
 void uart_println(const char *s) {
+    uart_print(s);
+    uart_print("\r\n");
+}
+
+/* Numero de lineas escritas desde la ultima cabecera del listado.
+ * Se usa para subir el cursor en el siguiente redibujado (la UART no tiene
+ * direccionamiento de pantalla, asi que el listado se reescribe encima). */
+static uint8_t uart_lines_written = 0;
+
+/* La cabecera del listado se imprime UNA sola vez, no en cada redibujado.
+ * Asi el bloque que se reposiciona no incluye lineas fijas y el conteo de
+ * uart_lines_written no depende de cuantas lineas ocupe la cabecera. */
+static uint8_t uart_header_done = 0;
+
+/* Escribe una linea limpiandola antes (ESC[K) y terminando en CRLF.
+ * El borrado evita restos de lineas mas largas escritas previamente. */
+static void uart_put_line(const char *s) {
+    rom_uart_putc(0x1B);
+    rom_uart_putc('[');
+    rom_uart_putc('K');
     uart_print(s);
     uart_print("\r\n");
 }
@@ -307,7 +342,89 @@ void quit_to_monitor(void) {
  * ============================================================================ */
 
 /* Numero de lineas de una pagina del listado */
-#define LIST_LINES  12  /* 10 apps + separator + footer */
+#define LIST_LINES  12  /* (legado UART; la pantalla usa su propio layout) */
+
+/* Filas del listado que muestra la UART (ventana con scroll). Solo afecta a
+ * la salida serie: en pantalla se muestra unicamente la app seleccionada. */
+#define UART_LIST_ROWS  10
+
+/* ============================================================================
+ * LAYOUT DE LA PANTALLA (40x30)
+ * ============================================================================
+ * La pantalla muestra SOLO la app seleccionada, no el listado completo.
+ * Motivo: el launcher debe caber por debajo de $312E, el techo de RAM que el
+ * monitor deja libre. Dibujar las 26 filas del listado exigia un bucle, una
+ * ventana con scroll y el borrado de filas sobrantes; mostrando solo la
+ * seleccion nada de eso hace falta.
+ *
+ * El listado completo sigue disponible por UART, que es donde aporta.
+ *
+ * Reparto:
+ *   fila  0        : titulo
+ *   fila  1        : separador
+ *   fila  6        : "SELECCIONADA:"
+ *   fila  8        : nombre de la app (resaltado)
+ *   fila 11        : separador
+ *   fila 13        : "App N/Total"
+ *   fila 15..16    : instrucciones (navegar / ejecutar)
+ *   fila 22..      : zona de MENSAJES (cargando, errores)
+ *
+ * La zona de mensajes empieza por debajo de todo lo anterior para que
+ * console_print (que avanza fila a fila) no pise el menu. launch_app vuelve
+ * el cursor a SCR_MSG_ROW antes de escribir. */
+#define SCR_TITLE_ROW    0
+#define SCR_SEP1_ROW     1
+#define SCR_LABEL_ROW    6
+#define SCR_NAME_ROW     8
+#define SCR_SEP2_ROW     11
+#define SCR_INFO_ROW     13
+#define SCR_HINT_ROW     15
+#define SCR_MSG_ROW      22
+
+/* Paletas del menu (ver CONSOLE_PAL_* en console.h) */
+#define PAL_NORMAL       CONSOLE_PAL_NORMAL     /* texto normal */
+#define PAL_SELECTED     CONSOLE_PAL_SELECTED   /* app seleccionada (resaltada) */
+
+/**
+ * @brief Muestra en pantalla SOLO la app seleccionada.
+ *
+ * Idempotente y sin estado: cada llamada deja la pantalla en el estado
+ * correcto, asi que la navegacion no necesita recordar que cambio.
+ */
+static void screen_show_selected(app_entry_t* apps, uint8_t count,
+                                 uint8_t selected) {
+    console_put_padded(0, SCR_TITLE_ROW, "  APP LAUNCHER - Monitor 6502",
+                       CONSOLE_COLS, PAL_NORMAL);
+    console_put_padded(0, SCR_SEP1_ROW, SEP_DA, CONSOLE_COLS, PAL_NORMAL);
+
+    console_put_padded(0, SCR_LABEL_ROW, "  SELECCIONADA:",
+                       CONSOLE_COLS, PAL_NORMAL);
+
+    /* Nombre con sangria, resaltado por paleta */
+    console_put_padded(0, SCR_NAME_ROW, "   ", 3, PAL_SELECTED);
+    console_put_padded(3, SCR_NAME_ROW, apps[selected].name,
+                       CONSOLE_COLS - 3, PAL_SELECTED);
+
+    console_put_padded(0, SCR_SEP2_ROW, SEP_DA, CONSOLE_COLS, PAL_NORMAL);
+
+    /* Posicion en la lista */
+    console_put_padded(0, SCR_INFO_ROW, " App", 4, PAL_NORMAL);
+    console_put_num(4, SCR_INFO_ROW, selected + 1, 3, PAL_NORMAL);
+    console_put_padded(7, SCR_INFO_ROW, "/", 1, PAL_NORMAL);
+    console_put_num(8, SCR_INFO_ROW, count, 3, PAL_NORMAL);
+
+    /* Instrucciones: navegar y ejecutar. Se separan en dos lineas para no
+     * pasar de 40 columnas (41+ hace que la pantalla envuelva). */
+    console_put_padded(0, SCR_HINT_ROW, "  W/S o K1/K2 = Navegar",
+                       CONSOLE_COLS, PAL_NORMAL);
+    console_put_padded(0, SCR_HINT_ROW + 1, "  ENTER o K8   = Cargar y ejecutar",
+                       CONSOLE_COLS, PAL_NORMAL);
+
+    /* Limpiar la zona de mensajes: al navegar debe quedar vacia.
+     * Una sola llamada basta: con ancho CONSOLE_COLS limpia la fila entera. */
+    console_put_padded(0, SCR_MSG_ROW, "", CONSOLE_COLS, PAL_NORMAL);
+    console_put_padded(0, SCR_MSG_ROW + 1, "", CONSOLE_COLS, PAL_NORMAL);
+}
 
 /* Muestra el listado completo (con header y todo) */
 void show_app_list_full(app_entry_t* apps, uint8_t count, uint8_t selected, uint8_t scroll_offset) {
@@ -316,16 +433,38 @@ void show_app_list_full(app_entry_t* apps, uint8_t count, uint8_t selected, uint
     uint8_t idx;
     uint8_t len;
 
-    uart_print("\r\n\r\n=========================================\r\n");
-    uart_print("  APP LAUNCHER - Monitor 6502\r\n");
-    uart_print("=========================================\r\n");
-    uart_print("  W/S=Navegar  ENTER=Ejec  Q=Salir\r\n");
-    uart_print("-----------------------------------------\r\n");
+    /* La UART no tiene direccionamiento de pantalla: para redibujar hay que
+     * reescribir el bloque encima del anterior.
+     *
+     * DIFERENCIA CLAVE con una primera version: aqui NO se reescribe la
+     * cabecera. La cabecera se imprime UNA sola vez (ver uart_header_done) y
+     * los redibujados posteriores suben el cursor solo sobre las filas de
+     * apps, el separador y el pie. Si la cabecera entrara en el bloque
+     * redibujado, cualquier error en el conteo de lineas desplazaria el
+     * cursor y los listados se apilarian (nombres repetidos y basura). */
+    if (!uart_header_done) {
+        uart_put_line(SEP_EQ);
+        uart_put_line("  APP LAUNCHER - Monitor 6502");
+        uart_put_line(SEP_EQ);
+        uart_put_line("  W/S=Navegar  ENTER=Ejec  Q=Salir");
+        uart_put_line(SEP_DA);
+        uart_header_done = 1;
+    } else if (uart_lines_written > 0) {
+        /* Volver al inicio de las filas de apps (el bloque anterior) */
+        rom_uart_putc(0x1B);
+        rom_uart_putc('[');
+        uart_print_num16(uart_lines_written);
+        rom_uart_putc('A');
+    }
 
-    display_count = (count - scroll_offset < 10) ? (count - scroll_offset) : 10;
+    display_count = (count - scroll_offset < UART_LIST_ROWS) ? (count - scroll_offset) : UART_LIST_ROWS;
 
     for (i = 0; i < display_count; i++) {
         idx = scroll_offset + i;
+
+        rom_uart_putc(0x1B);
+        rom_uart_putc('[');
+        rom_uart_putc('K');   /* limpiar la linea */
 
         if (idx == selected) {
             uart_print(" > ");
@@ -349,67 +488,8 @@ void show_app_list_full(app_entry_t* apps, uint8_t count, uint8_t selected, uint
         uart_print(" bytes)\r\n");
     }
 
-    uart_print("-----------------------------------------\r\n");
-    uart_print("  App ");
-    uart_print_num16(selected + 1);
-    uart_print("/");
-    uart_print_num16(count);
-    uart_print("\r\n");
-}
+    uart_put_line(SEP_DA);
 
-/* Actualiza SOLO las lineas del listado (sin header), subiendo el cursor */
-void show_app_list_update(app_entry_t* apps, uint8_t count, uint8_t selected, uint8_t scroll_offset) {
-    uint8_t i;
-    uint8_t display_count;
-    uint8_t idx;
-    uint8_t len;
-
-    /* Subir cursor hasta el inicio del listado */
-    display_count = (count - scroll_offset < 10) ? (count - scroll_offset) : 10;
-    {
-        uint8_t lines = display_count + 2;  /* apps + separator + footer */
-        rom_uart_putc(0x1B);  /* ESC */
-        rom_uart_putc('[');
-        uart_print_num16(lines);
-        rom_uart_putc('A');   /* cursor up */
-    }
-
-    for (i = 0; i < display_count; i++) {
-        idx = scroll_offset + i;
-
-        rom_uart_putc(0x1B);  /* ESC */
-        rom_uart_putc('[');
-        rom_uart_putc('K');   /* clear line */
-
-        if (idx == selected) {
-            uart_print(" > ");
-        } else {
-            uart_print("   ");
-        }
-
-        uart_print_num16(idx + 1);
-        uart_print(": ");
-        uart_print(apps[idx].name);
-
-        len = 0;
-        while (apps[idx].name[len] != '\0' && len < 12) len++;
-        while (len < 12) {
-            rom_uart_putc(' ');
-            len++;
-        }
-
-        uart_print(" (");
-        uart_print_num16(apps[idx].size);
-        uart_print(" bytes)\r\n");
-    }
-
-    /* Separator */
-    rom_uart_putc(0x1B);
-    rom_uart_putc('[');
-    rom_uart_putc('K');
-    uart_print("-----------------------------------------\r\n");
-
-    /* Footer */
     rom_uart_putc(0x1B);
     rom_uart_putc('[');
     rom_uart_putc('K');
@@ -418,6 +498,15 @@ void show_app_list_update(app_entry_t* apps, uint8_t count, uint8_t selected, ui
     uart_print("/");
     uart_print_num16(count);
     uart_print("\r\n");
+
+    /* Lineas del bloque redibujable: display_count filas + 1 separador
+     * + 1 pie. La cabecera NO cuenta: se imprime una sola vez. */
+    uart_lines_written = display_count + 2;
+
+    /* Pantalla HDMI: solo la app seleccionada (ver screen_show_selected).
+     * El listado completo se queda en la UART: en pantalla manda el layout
+     * de filas fijas y no cabe un listado con scroll. */
+    screen_show_selected(apps, count, selected);
 }
 
 
@@ -426,15 +515,30 @@ void show_app_list_update(app_entry_t* apps, uint8_t count, uint8_t selected, ui
  * ============================================================================ */
 
 void launch_app(app_entry_t* app) {
-    uart_print("\r\n=========================================\r\n");
+    /* UART: aviso al flujo serie (una sola vez, no toca la pantalla). */
+    uart_print("\r\n" SEP_EQ "\r\n");
     uart_print("  CARGANDO Y EJECUTANDO\r\n");
-    uart_print("=========================================\r\n");
+    uart_print(SEP_EQ "\r\n");
     uart_print("  Archivo: ");
     uart_print(app->name);
     uart_print("\r\n");
-    uart_print("  Cargando en $0800 y ejecutando...\r\n");
+    uart_print("  Cargando en $0800...\r\n");
 
-    rom_delay_ms(200);
+    /* Pantalla: la zona de mensajes, por debajo del menu.
+     * Aqui SI se usa console_put_padded (posicion fija) y no console_print:
+     * el cursor secuencial de pantalla no debe moverse por culpa de mensajes. */
+    console_put_padded(0, SCR_MSG_ROW, SEP_EQ, CONSOLE_COLS, PAL_NORMAL);
+    console_put_padded(0, SCR_MSG_ROW + 1, "  CARGANDO Y EJECUTANDO",
+                       CONSOLE_COLS, PAL_NORMAL);
+    console_put_padded(0, SCR_MSG_ROW + 2, "  Archivo:", 11, PAL_NORMAL);
+    console_put_padded(11, SCR_MSG_ROW + 2, app->name, CONSOLE_COLS - 11,
+                       PAL_NORMAL);
+
+    /* Esperar a que la UART termine de transmitir antes de sobrescribirnos.
+     * Las cadenas de arriba se encolan en el FIFO; sin esta espera, el
+     * launcher se destruye a mitad de transmision y el log queda cortado. */
+    while (!rom_uart_tx_ready()) { }
+    rom_delay_ms(20);
 
     /* Apagar el display ANTES de cargar: una vez que rom_mfs_load_run
      * sobrescribe el launcher en $0800, ya no podemos usar el TM1638. */
@@ -447,6 +551,8 @@ void launch_app(app_entry_t* app) {
     /* Si retorna, algo fallo */
     uart_print("  ERROR: No se pudo cargar\r\n");
     uart_print("  Presione ENTER para continuar\r\n");
+    console_put_padded(0, SCR_MSG_ROW + 4, "  ERROR: No se pudo cargar",
+                       CONSOLE_COLS, PAL_NORMAL);
     while (rom_uart_getc() != UART_KEY_SELECT);
 }
 
@@ -456,6 +562,9 @@ void launch_app(app_entry_t* app) {
  * ============================================================================ */
 
 int main(void) {
+    /* apps[] esta dimensionado para caber en el stack (16*15 = 240 de 256).
+     * Si se sube MAX_APPS, mover esta declaracion a BSS (static) o subir
+     * __STACKSIZE__ en programa.cfg. */
     app_entry_t apps[MAX_APPS];
     uint8_t app_count;
     uint8_t selected = 0;
@@ -463,7 +572,7 @@ int main(void) {
     uint8_t last_tm1638_key = 0;
     uint8_t key;
     char uart_char;
-    uint8_t redraw_mode = 0;  /* 0=none, 1=full, 2=partial */
+    uint8_t redraw_mode = 0;  /* 0=ninguno, distinto de 0 = redibujar */
     uint8_t needs_tm1638_update = 1;
     uint8_t last_selected = 0;
     uint8_t last_scroll = 0;
@@ -472,32 +581,41 @@ int main(void) {
      * INICIALIZACIÓN
      * ============================================ */
 
-    /* Banner de bienvenida por UART */
-    uart_print("\r\n\r\n");
-    uart_print("=========================================\r\n");
-    uart_print("  APP LAUNCHER v1.0\r\n");
-    uart_print("  Monitor 6502 - Tang Nano 9K\r\n");
-    uart_print("=========================================\r\n\r\n");
+    /* Inicializar la salida HDMI (modo texto del core de video).
+     * Debe ir ANTES del primer console_print: espera VIDEO_READY y limpia
+     * la pantalla. La UART ya la deja lista el monitor. */
+    console_init();
+
+    /* Banner de bienvenida.
+     * console_print escribe en los DOS destinos: antes de que exista el menu
+     * la pantalla esta vacia y el cursor secuencial es lo correcto.
+     * El listado y los avisos posteriores van solo por UART, porque en
+     * pantalla manda el layout de filas fijas del menu. */
+    console_print(SEP_EQ "\r\n");
+    console_print("  APP LAUNCHER v1.0\r\n");
+    console_print("  Monitor 6502 - Tang Nano 9K\r\n");
+    console_print(SEP_EQ "\r\n");
+    console_print("\r\n");
 
     /* Inicializar TM1638 */
-    uart_print("Inicializando TM1638...\r\n");
+    console_print("Inicializando TM1638...\r\n");
     tm1638_init();
     tm1638_set_brightness(5);
     tm1638_show_text(" LAUNCH ");
-    uart_print("  OK\r\n\r\n");
+    console_print("  OK\r\n\r\n");
 
     /* Escanear aplicaciones en SD */
     app_count = scan_apps(apps, MAX_APPS);
 
     if (app_count == 0) {
-        uart_print("\r\n=========================================\r\n");
-        uart_print("  NO SE ENCONTRARON APLICACIONES\r\n");
-        uart_print("=========================================\r\n");
-        uart_print("\r\n  Posibles causas:\r\n");
-        uart_print("  1. SD Card no insertada\r\n");
-        uart_print("  2. SD no formateada como FAT12/16\r\n");
-        uart_print("  3. No hay archivos en la raiz\r\n");
-        uart_print("\r\n  Presione RESET para reintentar\r\n");
+        console_print("\r\n" SEP_EQ "\r\n");
+        console_print("  NO SE ENCONTRARON APLICACIONES\r\n");
+        console_print(SEP_EQ "\r\n");
+        console_print("\r\n  Posibles causas:\r\n");
+        console_print("  1. SD Card no insertada\r\n");
+        console_print("  2. SD no formateada como FAT12/16\r\n");
+        console_print("  3. No hay archivos en la raiz\r\n");
+        console_print("\r\n  Presione RESET para reintentar\r\n");
 
         tm1638_show_error("NO  FILE");
 
@@ -507,14 +625,25 @@ int main(void) {
         }
     }
 
-    uart_print("\r\n  Controles: W/S=Subir/Bajar  ENTER=Ejecutar  Q=Salir\r\n");
-    uart_print("  TM1638:  K1=Subir  K2=Bajar  K8=Ejecutar  K7=Salir\r\n\r\n");
+    /* Ayuda por UART. La pantalla la cubre el menu, no estos avisos. */
+    uart_print("\r\n  Controles: W/S=Navegar  ENTER=Ejecutar\r\n");
+    uart_print("  Q=Salir\r\n");
+    uart_print("  TM1638: K1/K2=Navegar K8=Ejec K7=Salir\r\n");
     rom_delay_ms(500);
+
+    /* El banner de arranque y el menu no pueden convivir: el banner usa el
+     * cursor secuencial de console_print y el menu escribe en filas fijas.
+     * Se limpia la pantalla para que el menu parta de un lienzo vacio. */
+    console_vblank_begin();
+    console_clear();
+    console_vblank_end();
 
     /* Dibujar listado inicial completo */
     last_scroll = scroll_offset;
     last_selected = selected;
+    console_vblank_begin();
     show_app_list_full(apps, app_count, selected, scroll_offset);
+    console_vblank_end();
     needs_tm1638_update = 1;
 
     /* ============================================
@@ -522,14 +651,19 @@ int main(void) {
      * ============================================ */
 
     while (1) {
-        /* Redibujar si es necesario */
-        if (redraw_mode == 1) {
+        /* Redibujar si es necesario.
+         * show_app_list_full es idempotente y repinta los dos destinos, asi
+         * que ya no hay distincion entre redibujado completo y parcial.
+         *
+         * El dibujado va DENTRO de VBLANK: la VRAM solo se puede escribir
+         * fuera de la zona visible. El menu hace ~500 escrituras por
+         * redibujado; fuera de VBLANK el core puede leer la VRAM mientras
+         * se escribe, y eso corrompe el estado del controlador. */
+        if (redraw_mode) {
+            console_vblank_begin();
             show_app_list_full(apps, app_count, selected, scroll_offset);
+            console_vblank_end();
             last_scroll = scroll_offset;
-            last_selected = selected;
-            redraw_mode = 0;
-        } else if (redraw_mode == 2) {
-            show_app_list_update(apps, app_count, selected, scroll_offset);
             last_selected = selected;
             redraw_mode = 0;
         }
@@ -553,24 +687,23 @@ int main(void) {
             if (uart_char == UART_KEY_UP_W || uart_char == UART_KEY_UP_W_CAPS || uart_char == UART_KEY_UP_8) {
                 if (selected > 0) {
                     selected--;
+                    /* Mantener la seleccion dentro de la ventana de 10 filas
+                     * que muestra la UART. La pantalla HDMI solo muestra la
+                     * app seleccionada, asi que no necesita ventana. */
                     if (selected < scroll_offset) {
                         scroll_offset = selected;
-                        redraw_mode = 1;  /* full: cambio de pagina */
-                    } else {
-                        redraw_mode = 2;  /* partial: mismo scroll */
                     }
+                    redraw_mode = 1;
                     needs_tm1638_update = 1;
                 }
             }
             else if (uart_char == UART_KEY_DOWN_S || uart_char == UART_KEY_DOWN_S_CAPS || uart_char == UART_KEY_DOWN_2) {
                 if (selected < app_count - 1) {
                     selected++;
-                    if (selected >= scroll_offset + 10) {
-                        scroll_offset = selected - 9;
-                        redraw_mode = 1;  /* full: cambio de pagina */
-                    } else {
-                        redraw_mode = 2;  /* partial: mismo scroll */
+                    if (selected >= scroll_offset + UART_LIST_ROWS) {
+                        scroll_offset = selected - (UART_LIST_ROWS - 1);
                     }
+                    redraw_mode = 1;
                     needs_tm1638_update = 1;
                 }
             }
@@ -583,7 +716,7 @@ int main(void) {
                 launch_app(&apps[selected]);
 
                 /* Si volvemos (el binario retornó o falló), continuar */
-                uart_print("\r\n  Aplicacion finalizada. Reiniciando lanzador...\r\n\r\n");
+                uart_print("\r\n  Aplicacion finalizada. Reiniciando...\r\n\r\n");
                 redraw_mode = 1;
                 needs_tm1638_update = 1;
 
@@ -628,12 +761,10 @@ int main(void) {
             else if (key == TM_KEY_DOWN) {
                 if (selected < app_count - 1) {
                     selected++;
-                    if (selected >= scroll_offset + 10) {
-                        scroll_offset = selected - 9;
-                        redraw_mode = 1;
-                    } else {
-                        redraw_mode = 2;
+                    if (selected >= scroll_offset + UART_LIST_ROWS) {
+                        scroll_offset = selected - (UART_LIST_ROWS - 1);
                     }
+                    redraw_mode = 1;
                     needs_tm1638_update = 1;
                 }
             }
