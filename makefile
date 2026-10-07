@@ -28,10 +28,9 @@ BUILD_DIR = build
 OUTPUT_DIR = output
 
 # Libreria TM1638: repositorio externo referenciado, NO copiado.
-# Comparte el codigo con otros proyectos; se actualiza con 'git pull'
-# en D:\Proyectos\libs\tm1638-6502-cc65.
+# Comparte el codigo con otros proyectos; se actualiza con 'git pull'.
 # Ajustar aqui si la libreria cambia de ubicacion.
-TM1638_DIR = D:\Proyectos\libs\tm1638-6502-cc65
+TM1638_DIR = D:\Proyectos\tm1638-6502-cc65
 
 # Libreria del Core de Video (modo texto en HDMI). Tambien referenciada.
 # Solo se enlazan los objetos que el launcher usa: no hay que sumar vc.lib
@@ -50,6 +49,11 @@ LD_CONFIG = $(CONFIG_DIR)\programa.cfg
 # inyectar ruido en senales que compartan el byte del puerto. La libreria lo
 # protege con #ifndef para que cada proyecto lo sobrescriba sin editarla.
 # Ver docs/PIN_ISOLATION_AND_NOISE.md en la libreria.
+#
+# Se probo subirlo a 20 para reducir ruido en el audio: NO sirvio, el ruido
+# sonaba igual y el display quedo lento. El ruido lo causa la corriente de los
+# segmentos, no la velocidad de conmutacion; se resuelve con el boton LEFT del
+# joystick (tm1638_display_off/on). Se deja en 8.
 TM1638_TIMING_DELAY = 8
 
 # Nombre del programa
@@ -60,11 +64,11 @@ PROGRAM = $(OUTPUT_DIR)\$(PROGRAM_NAME).bin
 MAP_FILE = $(OUTPUT_DIR)\$(PROGRAM_NAME).map
 
 # Archivos fuente
-C_SOURCES = $(SRC_DIR)\main.c $(SRC_DIR)\console.c $(TM1638_DIR)\src\tm1638.c
+C_SOURCES = $(SRC_DIR)\main.c $(SRC_DIR)\joy.c $(TM1638_DIR)\src\tm1638.c
 ASM_SOURCES = $(SRC_DIR)\startup.s
 
 # Archivos objeto
-C_OBJECTS = $(BUILD_DIR)\main.o $(BUILD_DIR)\console.o $(BUILD_DIR)\tm1638.o
+C_OBJECTS = $(BUILD_DIR)\main.o $(BUILD_DIR)\joy.o $(BUILD_DIR)\tm1638.o
 ASM_OBJECTS = $(BUILD_DIR)\startup.o
 
 OBJECTS = $(ASM_OBJECTS) $(C_OBJECTS)
@@ -115,11 +119,11 @@ dirs:
 # (ver orden de -I). Por eso main.o depende tambien de ese header: sin esta
 # dependencia, un 'git pull' en la libreria no recompilaria main.o y quedaria
 # con declaraciones viejas.
-$(BUILD_DIR)\main.o: $(SRC_DIR)\main.c $(TM1638_DIR)\include\tm1638.h
+$(BUILD_DIR)\main.o: $(SRC_DIR)\main.c $(TM1638_DIR)\include\tm1638.h $(SRC_DIR)\joy.h $(VC_DIR)\src\video.h
 	$(CC) -c $(CFLAGS) -o $@ $<
 
-$(BUILD_DIR)\console.o: $(SRC_DIR)\console.c $(SRC_DIR)\console.h $(VC_DIR)\src\video.h include\romapi.h
-	$(CC) -c $(CFLAGS) -o $@ $(SRC_DIR)\console.c
+$(BUILD_DIR)\joy.o: $(SRC_DIR)\joy.c $(SRC_DIR)\joy.h
+	$(CC) -c $(CFLAGS) -o $@ $(SRC_DIR)\joy.c
 
 $(BUILD_DIR)\tm1638.o: $(TM1638_DIR)\src\tm1638.c $(TM1638_DIR)\include\tm1638.h
 	$(CC) -c $(CFLAGS) -o $@ $(TM1638_DIR)\src\tm1638.c

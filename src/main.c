@@ -42,7 +42,8 @@
 #include <stdint.h>
 #include "romapi.h"
 #include "tm1638.h"
-#include "console.h"
+#include "joy.h"
+#include "video.h"
 
 
 /* ============================================================================
@@ -64,10 +65,14 @@
 /* El buffer temporal ya no es necesario: rom_mfs_load_run()
  * carga el archivo directamente en $0800 sobrescribiendonos. */
 
-/* Separadores de 40 columnas: coinciden EXACTAMENTE con CONSOLE_COLS.
+/* Separadores de 40 columnas: coinciden EXACTAMENTE con VC_SCREEN_COLS.
  * Un caracter de mas hace que la pantalla envuelva y deje una linea huerfana. */
 #define SEP_EQ  "========================================"   /* 40 '=' */
 #define SEP_DA  "----------------------------------------"   /* 40 '-' */
+
+/* Brillo normal del display del TM1638 (0-7). El boton LEFT del joystick
+ * lo alterna entre este valor y apagado total. */
+#define TM1638_BRIGHTNESS   5
 
 /* TM1638 key mapping */
 #define TM_KEY_UP           1       /* S1 - Subir */
@@ -98,6 +103,17 @@ typedef struct {
     uint16_t size;                 /* Tamaño en bytes */
 } app_entry_t;
 
+/* Lista de aplicaciones, en BSS y NO en el stack.
+ *
+ * El stack son 256 bytes (__STACKSIZE__ en programa.cfg). apps[16] ocupa 240,
+ * dejando 6 bytes de margen: cualquier variable local nueva desborda y
+ * corrompe los datos de encima.
+ *
+ * El sintoma es inconfundible: el listado repite bloques de lineas y el
+ * joystick/boton dejan de responder, porque scroll_offset, joy_prev y demas
+ * quedan pisados. */
+static app_entry_t apps[MAX_APPS];
+
 
 /* ============================================================================
  * FUNCIONES AUXILIARES UART
@@ -105,11 +121,6 @@ typedef struct {
 
 void uart_print(const char *s) {
     while (*s) rom_uart_putc(*s++);
-}
-
-void uart_println(const char *s) {
-    uart_print(s);
-    uart_print("\r\n");
 }
 
 /* Numero de lineas escritas desde la ultima cabecera del listado.
@@ -160,66 +171,128 @@ void uart_print_num16(uint16_t n) {
     }
 }
 
-void uart_print_hex8(uint8_t n) {
-    const char hex[] = "0123456789ABCDEF";
-    rom_uart_putc(hex[(n >> 4) & 0x0F]);
-    rom_uart_putc(hex[n & 0x0F]);
+
+/* ============================================================================
+ * SALIDA DE TEXTO (UART + PANTALLA HDMI)
+ * ============================================================================
+ * El core de video se usa directamente (vc_*), sin capa intermedia: casi todo
+ * el acceso a la VRAM es una llamada directa a la libreria.
+ *
+ * Lo unico que necesita codigo propio es el DOBLE DESTINO (UART + pantalla) y
+ * el relleno de celdas, porque vc_put_str no rellena y dejaría restos del
+ * texto anterior al redibujar encima.
+ */
+
+/* Fila del cursor secuencial de la pantalla. console-like: avanza a medida que
+ * se imprime, para los mensajes de arranque que van de arriba a abajo. */
+static uint8_t scr_row = 0;
+
+/**
+ * @brief Escribe una cadena en la pantalla tratando '\n' como salto de linea.
+ *
+ * vc_put_str ya envuelve al llegar a la columna 40, pero no interpreta '\n'.
+ * Devuelve la fila siguiente a la ultima escrita.
+ */
+static uint8_t screen_puts(uint8_t row, const char *s) {
+    uint8_t col = 0;
+
+    while (*s) {
+        if (*s == '\n') {
+            row++;
+            if (row >= VC_SCREEN_ROWS) row = 0;
+            col = 0;
+        } else if (*s != '\r') {
+            vc_put_cell(col, row, (uint8_t)*s);
+            col++;
+            if (col >= VC_SCREEN_COLS) {
+                col = 0;
+                row++;
+                if (row >= VC_SCREEN_ROWS) row = 0;
+            }
+        }
+        s++;
+    }
+
+    return row;
 }
 
-void uart_print_hex16(uint16_t n) {
-    uart_print_hex8((uint8_t)(n >> 8));
-    uart_print_hex8((uint8_t)(n & 0xFF));
+/**
+ * @brief Imprime en los DOS destinos (UART y pantalla).
+ *
+ * Es el equivalente a console_print: existe porque los mensajes de flujo
+ * (arranque, errores) deben verse tanto en el terminal serie como en HDMI, y
+ * sin esta funcion cada mensaje habria que escribirlo dos veces.
+ */
+static void print_dual(const char *s) {
+    const char *p;
+
+    for (p = s; *p; p++) {
+        rom_uart_putc(*p);
+    }
+    scr_row = screen_puts(scr_row, s);
+}
+
+/**
+ * @brief Escribe texto en una fila, rellenando hasta 'width' columnas.
+ *
+ * Rellenar (en vez de solo escribir el texto) garantiza que al redibujar una
+ * fila no queden restos del texto anterior mas largo.
+ */
+static void put_padded(uint8_t col, uint8_t row, const char *s,
+                       uint8_t width, uint8_t paleta) {
+    uint8_t i;
+
+    for (i = 0; i < width; i++) {
+        uint8_t c;
+
+        if (*s != '\0') {
+            c = (uint8_t)*s;
+            s++;
+        } else {
+            c = VC_CHAR_SPACE;
+        }
+
+        vc_put_cell(col + i, row, c);
+        vc_set_cell_attr(col + i, row, paleta, 0);
+    }
+}
+
+/**
+ * @brief Escribe un numero decimal alineado a la derecha en 'width' columnas.
+ */
+static void put_num(uint8_t col, uint8_t row, uint16_t n,
+                    uint8_t width, uint8_t paleta) {
+    char buf[6];
+    uint8_t len = 0;
+    uint8_t i;
+    uint8_t pad;
+
+    if (n == 0) {
+        buf[len] = '0';
+        len++;
+    } else {
+        while (n > 0 && len < 5) {
+            buf[len] = (char)('0' + (n % 10));
+            n /= 10;
+            len++;
+        }
+    }
+
+    pad = (width > len) ? (width - len) : 0;
+    for (i = 0; i < pad; i++) {
+        vc_put_cell(col + i, row, VC_CHAR_SPACE);
+        vc_set_cell_attr(col + i, row, paleta, 0);
+    }
+    for (i = 0; i < len; i++) {
+        vc_put_cell(col + pad + i, row, (uint8_t)buf[len - 1 - i]);
+        vc_set_cell_attr(col + pad + i, row, paleta, 0);
+    }
 }
 
 
 /* ============================================================================
  * FUNCIONES AUXILIARES TM1638
  * ============================================================================ */
-
-/* Muestra el índice en el display: "  1/10" */
-void tm1638_show_index(uint8_t current, uint8_t total) {
-    char buf[9];
-    uint8_t i;
-    uint8_t digit;
-    uint8_t n;
-    uint8_t pos;
-
-    /* Inicializar con espacios */
-    for (i = 0; i < 8; i++) {
-        buf[i] = ' ';
-    }
-    buf[8] = '\0';
-
-    /* Formato: "  1/10" en los últimos 5 dígitos */
-    /* Escribir total en las últimas posiciones */
-    n = total;
-    pos = 7;
-    if (n == 0) {
-        buf[pos--] = '0';
-    } else {
-        while (n > 0 && pos > 3) {
-            digit = n % 10;
-            buf[pos--] = digit + '0';
-            n /= 10;
-        }
-    }
-
-    buf[pos--] = '/';
-
-    /* Escribir current */
-    n = current;
-    if (n == 0) {
-        buf[pos--] = '0';
-    } else {
-        while (n > 0 && pos > 0) {
-            digit = n % 10;
-            buf[pos--] = digit + '0';
-            n /= 10;
-        }
-    }
-
-    tm1638_show_text(buf);
-}
 
 /* Muestra un mensaje de error en TM1638 */
 void tm1638_show_error(const char* msg) {
@@ -271,29 +344,24 @@ uint8_t scan_apps(app_entry_t* apps, uint8_t max_apps) {
     uint8_t* entry;
     uint16_t file_size;
 
-    uart_print("Escaneando SD Card...\r\n");
-
-    /* Inicializar SD */
+    /* Sin mensajes de exito: solo se avisa si algo falla.
+     * Cada linea de estado costaba ROM y solo interesa al depurar. */
     result = rom_sd_init();
     if (result != SD_OK) {
-        uart_print("  ERROR: SD init fallo (codigo ");
+        uart_print("ERROR: SD init (");
         uart_print_num16(result);
         uart_print(")\r\n");
         return 0;
     }
-    uart_print("  SD init OK\r\n");
 
     /* Montar MFS (cachea directorio en $0264) */
     result = rom_mfs_mount();
     if (result != MFS_OK) {
-        uart_print("  ERROR: MFS mount fallo (codigo ");
+        uart_print("ERROR: MFS mount (");
         uart_print_num16(result);
         uart_print(")\r\n");
         return 0;
     }
-    uart_print("  MFS mount OK\r\n");
-
-    /* Debug: quitar test mfs_get_size, ya sabemos que size esta en bytes 14-15 */
 
     /* Leer entradas del directorio desde $0264 */
     for (i = 0; i < FAT_ENTRIES && count < max_apps; i++) {
@@ -319,10 +387,6 @@ uint8_t scan_apps(app_entry_t* apps, uint8_t max_apps) {
         apps[count].size = file_size;
         count++;
     }
-
-    uart_print("  Archivos encontrados: ");
-    uart_print_num16(count);
-    uart_print("\r\n");
 
     return count;
 }
@@ -381,9 +445,9 @@ void quit_to_monitor(void) {
 #define SCR_HINT_ROW     15
 #define SCR_MSG_ROW      22
 
-/* Paletas del menu (ver CONSOLE_PAL_* en console.h) */
-#define PAL_NORMAL       CONSOLE_PAL_NORMAL     /* texto normal */
-#define PAL_SELECTED     CONSOLE_PAL_SELECTED   /* app seleccionada (resaltada) */
+/* Paletas del menu (del core de video) */
+#define PAL_NORMAL       VC_BGPAL_0     /* texto normal */
+#define PAL_SELECTED     VC_BGPAL_2     /* app seleccionada (resaltada) */
 
 /**
  * @brief Muestra en pantalla SOLO la app seleccionada.
@@ -393,37 +457,37 @@ void quit_to_monitor(void) {
  */
 static void screen_show_selected(app_entry_t* apps, uint8_t count,
                                  uint8_t selected) {
-    console_put_padded(0, SCR_TITLE_ROW, "  APP LAUNCHER - Monitor 6502",
-                       CONSOLE_COLS, PAL_NORMAL);
-    console_put_padded(0, SCR_SEP1_ROW, SEP_DA, CONSOLE_COLS, PAL_NORMAL);
+    put_padded(0, SCR_TITLE_ROW, "  APP LAUNCHER - Monitor 6502",
+                       VC_SCREEN_COLS, PAL_NORMAL);
+    put_padded(0, SCR_SEP1_ROW, SEP_DA, VC_SCREEN_COLS, PAL_NORMAL);
 
-    console_put_padded(0, SCR_LABEL_ROW, "  SELECCIONADA:",
-                       CONSOLE_COLS, PAL_NORMAL);
+    put_padded(0, SCR_LABEL_ROW, "  SELECCIONADA:",
+                       VC_SCREEN_COLS, PAL_NORMAL);
 
     /* Nombre con sangria, resaltado por paleta */
-    console_put_padded(0, SCR_NAME_ROW, "   ", 3, PAL_SELECTED);
-    console_put_padded(3, SCR_NAME_ROW, apps[selected].name,
-                       CONSOLE_COLS - 3, PAL_SELECTED);
+    put_padded(0, SCR_NAME_ROW, "   ", 3, PAL_SELECTED);
+    put_padded(3, SCR_NAME_ROW, apps[selected].name,
+                       VC_SCREEN_COLS - 3, PAL_SELECTED);
 
-    console_put_padded(0, SCR_SEP2_ROW, SEP_DA, CONSOLE_COLS, PAL_NORMAL);
+    put_padded(0, SCR_SEP2_ROW, SEP_DA, VC_SCREEN_COLS, PAL_NORMAL);
 
     /* Posicion en la lista */
-    console_put_padded(0, SCR_INFO_ROW, " App", 4, PAL_NORMAL);
-    console_put_num(4, SCR_INFO_ROW, selected + 1, 3, PAL_NORMAL);
-    console_put_padded(7, SCR_INFO_ROW, "/", 1, PAL_NORMAL);
-    console_put_num(8, SCR_INFO_ROW, count, 3, PAL_NORMAL);
+    put_padded(0, SCR_INFO_ROW, " App", 4, PAL_NORMAL);
+    put_num(4, SCR_INFO_ROW, selected + 1, 3, PAL_NORMAL);
+    put_padded(7, SCR_INFO_ROW, "/", 1, PAL_NORMAL);
+    put_num(8, SCR_INFO_ROW, count, 3, PAL_NORMAL);
 
     /* Instrucciones: navegar y ejecutar. Se separan en dos lineas para no
      * pasar de 40 columnas (41+ hace que la pantalla envuelva). */
-    console_put_padded(0, SCR_HINT_ROW, "  W/S o K1/K2 = Navegar",
-                       CONSOLE_COLS, PAL_NORMAL);
-    console_put_padded(0, SCR_HINT_ROW + 1, "  ENTER o K8   = Cargar y ejecutar",
-                       CONSOLE_COLS, PAL_NORMAL);
+    put_padded(0, SCR_HINT_ROW, "  W/S o K1/K2 = Navegar",
+                       VC_SCREEN_COLS, PAL_NORMAL);
+    put_padded(0, SCR_HINT_ROW + 1, "  ENTER o K8   = Cargar y ejecutar",
+                       VC_SCREEN_COLS, PAL_NORMAL);
 
     /* Limpiar la zona de mensajes: al navegar debe quedar vacia.
-     * Una sola llamada basta: con ancho CONSOLE_COLS limpia la fila entera. */
-    console_put_padded(0, SCR_MSG_ROW, "", CONSOLE_COLS, PAL_NORMAL);
-    console_put_padded(0, SCR_MSG_ROW + 1, "", CONSOLE_COLS, PAL_NORMAL);
+     * Una sola llamada basta: con ancho VC_SCREEN_COLS limpia la fila entera. */
+    put_padded(0, SCR_MSG_ROW, "", VC_SCREEN_COLS, PAL_NORMAL);
+    put_padded(0, SCR_MSG_ROW + 1, "", VC_SCREEN_COLS, PAL_NORMAL);
 }
 
 /* Muestra el listado completo (con header y todo) */
@@ -514,10 +578,16 @@ void show_app_list_full(app_entry_t* apps, uint8_t count, uint8_t selected, uint
  * CARGAR Y EJECUTAR APLICACIÓN
  * ============================================================================ */
 
+/* Textos que se usan en los dos destinos (UART y pantalla). Declararlos una
+ * vez evita que el compilador guarde dos copias casi identicas: la de UART
+ * lleva '\r\n' y la de pantalla no, asi que no se deduplican solas. */
+#define MSG_LOADING  "  CARGANDO Y EJECUTANDO"
+#define MSG_ERR      "  ERROR: No se pudo cargar"
+
 void launch_app(app_entry_t* app) {
     /* UART: aviso al flujo serie (una sola vez, no toca la pantalla). */
     uart_print("\r\n" SEP_EQ "\r\n");
-    uart_print("  CARGANDO Y EJECUTANDO\r\n");
+    uart_print(MSG_LOADING "\r\n");
     uart_print(SEP_EQ "\r\n");
     uart_print("  Archivo: ");
     uart_print(app->name);
@@ -525,13 +595,13 @@ void launch_app(app_entry_t* app) {
     uart_print("  Cargando en $0800...\r\n");
 
     /* Pantalla: la zona de mensajes, por debajo del menu.
-     * Aqui SI se usa console_put_padded (posicion fija) y no console_print:
+     * Aqui SI se usa put_padded (posicion fija) y no console_print:
      * el cursor secuencial de pantalla no debe moverse por culpa de mensajes. */
-    console_put_padded(0, SCR_MSG_ROW, SEP_EQ, CONSOLE_COLS, PAL_NORMAL);
-    console_put_padded(0, SCR_MSG_ROW + 1, "  CARGANDO Y EJECUTANDO",
-                       CONSOLE_COLS, PAL_NORMAL);
-    console_put_padded(0, SCR_MSG_ROW + 2, "  Archivo:", 11, PAL_NORMAL);
-    console_put_padded(11, SCR_MSG_ROW + 2, app->name, CONSOLE_COLS - 11,
+    put_padded(0, SCR_MSG_ROW, SEP_EQ, VC_SCREEN_COLS, PAL_NORMAL);
+    put_padded(0, SCR_MSG_ROW + 1, MSG_LOADING,
+                       VC_SCREEN_COLS, PAL_NORMAL);
+    put_padded(0, SCR_MSG_ROW + 2, "  Archivo:", 11, PAL_NORMAL);
+    put_padded(11, SCR_MSG_ROW + 2, app->name, VC_SCREEN_COLS - 11,
                        PAL_NORMAL);
 
     /* Esperar a que la UART termine de transmitir antes de sobrescribirnos.
@@ -549,10 +619,10 @@ void launch_app(app_entry_t* app) {
     rom_mfs_load_run(app->name, LOAD_ADDR);
 
     /* Si retorna, algo fallo */
-    uart_print("  ERROR: No se pudo cargar\r\n");
+    uart_print(MSG_ERR "\r\n");
     uart_print("  Presione ENTER para continuar\r\n");
-    console_put_padded(0, SCR_MSG_ROW + 4, "  ERROR: No se pudo cargar",
-                       CONSOLE_COLS, PAL_NORMAL);
+    put_padded(0, SCR_MSG_ROW + 4, MSG_ERR,
+                       VC_SCREEN_COLS, PAL_NORMAL);
     while (rom_uart_getc() != UART_KEY_SELECT);
 }
 
@@ -562,10 +632,6 @@ void launch_app(app_entry_t* app) {
  * ============================================================================ */
 
 int main(void) {
-    /* apps[] esta dimensionado para caber en el stack (16*15 = 240 de 256).
-     * Si se sube MAX_APPS, mover esta declaracion a BSS (static) o subir
-     * __STACKSIZE__ en programa.cfg. */
-    app_entry_t apps[MAX_APPS];
     uint8_t app_count;
     uint8_t selected = 0;
     uint8_t scroll_offset = 0;
@@ -576,46 +642,42 @@ int main(void) {
     uint8_t needs_tm1638_update = 1;
     uint8_t last_selected = 0;
     uint8_t last_scroll = 0;
+    uint8_t joy_prev = 0;   /* estado anterior del joystick, para el flanco */
+    uint8_t display_on = 1; /* display del TM1638 encendido (LEFT lo alterna) */
 
     /* ============================================
      * INICIALIZACIÓN
      * ============================================ */
 
     /* Inicializar la salida HDMI (modo texto del core de video).
-     * Debe ir ANTES del primer console_print: espera VIDEO_READY y limpia
-     * la pantalla. La UART ya la deja lista el monitor. */
-    console_init();
+     * Espera a VIDEO_READY y limpia la pantalla. La UART ya la deja lista
+     * el monitor, no necesita inicializacion aqui. */
+    vc_wait_ready();
+    vc_text_init();
 
-    /* Banner de bienvenida.
-     * console_print escribe en los DOS destinos: antes de que exista el menu
-     * la pantalla esta vacia y el cursor secuencial es lo correcto.
-     * El listado y los avisos posteriores van solo por UART, porque en
-     * pantalla manda el layout de filas fijas del menu. */
-    console_print(SEP_EQ "\r\n");
-    console_print("  APP LAUNCHER v1.0\r\n");
-    console_print("  Monitor 6502 - Tang Nano 9K\r\n");
-    console_print(SEP_EQ "\r\n");
-    console_print("\r\n");
+    /* No hay banner ni mensajes de arranque: el menu HDMI y el listado UART
+     * ya informan del estado, y cada linea costaba ROM. */
 
     /* Inicializar TM1638 */
-    console_print("Inicializando TM1638...\r\n");
     tm1638_init();
-    tm1638_set_brightness(5);
+    tm1638_set_brightness(TM1638_BRIGHTNESS);
     tm1638_show_text(" LAUNCH ");
-    console_print("  OK\r\n\r\n");
+
+    /* Inicializar joystick (bits 3-7 del Puerto 1).
+     * Preserva los bits 0-2 del TM1638 con read-modify-write. */
+    joy_init();
 
     /* Escanear aplicaciones en SD */
     app_count = scan_apps(apps, MAX_APPS);
 
     if (app_count == 0) {
-        console_print("\r\n" SEP_EQ "\r\n");
-        console_print("  NO SE ENCONTRARON APLICACIONES\r\n");
-        console_print(SEP_EQ "\r\n");
-        console_print("\r\n  Posibles causas:\r\n");
-        console_print("  1. SD Card no insertada\r\n");
-        console_print("  2. SD no formateada como FAT12/16\r\n");
-        console_print("  3. No hay archivos en la raiz\r\n");
-        console_print("\r\n  Presione RESET para reintentar\r\n");
+        /* Mensaje corto: se ve una vez si la SD falla. La lista detallada de
+         * causas costaba ~150 bytes de ROM para algo que se lee una sola vez. */
+        print_dual("\r\n" SEP_EQ "\r\n");
+        print_dual("  NO HAY APLICACIONES\r\n");
+        print_dual(SEP_EQ "\r\n");
+        print_dual("  Revisar la SD (formato MFS).\r\n");
+        print_dual("  RESET para reintentar.\r\n");
 
         tm1638_show_error("NO  FILE");
 
@@ -625,25 +687,23 @@ int main(void) {
         }
     }
 
-    /* Ayuda por UART. La pantalla la cubre el menu, no estos avisos. */
-    uart_print("\r\n  Controles: W/S=Navegar  ENTER=Ejecutar\r\n");
-    uart_print("  Q=Salir\r\n");
-    uart_print("  TM1638: K1/K2=Navegar K8=Ejec K7=Salir\r\n");
+    /* Ayuda: una sola linea. El detalle esta en el menu HDMI. */
+    uart_print("\r\n  W/S o joystick: navegar.  ENTER/FIRE: cargar.  Q: salir\r\n");
     rom_delay_ms(500);
 
     /* El banner de arranque y el menu no pueden convivir: el banner usa el
      * cursor secuencial de console_print y el menu escribe en filas fijas.
      * Se limpia la pantalla para que el menu parta de un lienzo vacio. */
-    console_vblank_begin();
-    console_clear();
-    console_vblank_end();
+    vc_wait_vblank();
+    vc_text_init();
+    vc_wait_vblank_end();
 
     /* Dibujar listado inicial completo */
     last_scroll = scroll_offset;
     last_selected = selected;
-    console_vblank_begin();
+    vc_wait_vblank();
     show_app_list_full(apps, app_count, selected, scroll_offset);
-    console_vblank_end();
+    vc_wait_vblank_end();
     needs_tm1638_update = 1;
 
     /* ============================================
@@ -660,9 +720,9 @@ int main(void) {
          * redibujado; fuera de VBLANK el core puede leer la VRAM mientras
          * se escribe, y eso corrompe el estado del controlador. */
         if (redraw_mode) {
-            console_vblank_begin();
+            vc_wait_vblank();
             show_app_list_full(apps, app_count, selected, scroll_offset);
-            console_vblank_end();
+            vc_wait_vblank_end();
             last_scroll = scroll_offset;
             last_selected = selected;
             redraw_mode = 0;
@@ -735,6 +795,104 @@ int main(void) {
                 }
                 scroll_offset = 0;
             }
+        }
+
+        /* ============================================
+         * ENTRADA POR JOYSTICK
+         * ============================================
+         * Se detecta el FLANCO de cada dirección (pulsación nueva), no el
+         * nivel: mantener el joystick a un lado no debe recorrer la lista a
+         * toda velocidad, sino moverse una posición por toque. */
+        {
+            uint8_t j;
+
+            /* Reconfigurar el joystick en CADA vuelta.
+             *
+             * El TM1638 escribe el mismo registro $C002 (config del puerto) en
+             * cada operacion para alternar el bit DIO. Si ese registro NO
+             * devuelve por lectura lo que se escribio (habitual en FPGA con
+             * registros de config write-only), el read-modify-write del driver
+             * no preserva los bits 3-7 y deja la config del joystick corrupta:
+             * el joystick funciona un momento y luego deja de responder.
+             *
+             * Reconfigurar aqui es barato (una escritura) y garantiza que los
+             * bits 3-7 esten como entrada antes de leer. */
+            joy_init();
+            j = joy_read();
+
+            /* LEFT: encender/apagar el display del TM1638 (toggle).
+             *
+             * Apagarlo elimina el ruido que el modulo inyecta en el audio:
+             * con el display realmente OFF no circula corriente por los
+             * segmentos ni se conmutan los pines del display.
+             *
+             * No afecta al resto: la lectura del teclado del TM1638 y los
+             * botones K1/K2/K8/K7 siguen funcionando igual. */
+            if ((j & JOY_A_LEFT) && !(joy_prev & JOY_A_LEFT)) {
+                if (display_on) {
+                    tm1638_display_off();
+                    display_on = 0;
+                } else {
+                    tm1638_display_on();
+                    display_on = 1;
+                    needs_tm1638_update = 1;   /* repinta la seleccion actual */
+                }
+            }
+
+            if ((j & JOY_A_UP) && !(joy_prev & JOY_A_UP)) {
+                if (selected > 0) {
+                    selected--;
+                    if (selected < scroll_offset) {
+                        scroll_offset = selected;
+                    }
+                    redraw_mode = 1;
+                    needs_tm1638_update = 1;
+                }
+            }
+
+            if ((j & JOY_A_DOWN) && !(joy_prev & JOY_A_DOWN)) {
+                if (selected < app_count - 1) {
+                    selected++;
+                    if (selected >= scroll_offset + UART_LIST_ROWS) {
+                        scroll_offset = selected - (UART_LIST_ROWS - 1);
+                    }
+                    redraw_mode = 1;
+                    needs_tm1638_update = 1;
+                }
+            }
+
+            /* Fire: cargar y ejecutar la app seleccionada.
+             *
+             * Sin deteccion de flanco, a diferencia de UP/DOWN: el manual del
+             * joystick usa el nivel directamente (if (j & JOY_A_FIRE)), y
+             * ademas launch_app() puede tardar (carga de SD), durante lo cual
+             * el boton ya se solto. Con flanco, el estado previo quedaba
+             * desincronizado tras una carga lenta. */
+            if (j & JOY_A_FIRE) {
+                uart_print("\r\n");
+                launch_app(&apps[selected]);
+
+                /* Si volvemos (el binario retornó o falló), continuar */
+                uart_print("\r\n  Aplicacion finalizada. Reiniciando...\r\n\r\n");
+                redraw_mode = 1;
+                needs_tm1638_update = 1;
+
+                tm1638_show_text("RESCAN ");
+                app_count = scan_apps(apps, MAX_APPS);
+                if (app_count == 0) {
+                    uart_print("  No hay apps disponibles\r\n");
+                    tm1638_show_error("NO  FILE");
+                    while (1) {
+                        rom_delay_ms(1000);
+                    }
+                }
+                if (selected >= app_count) {
+                    selected = app_count - 1;
+                }
+                scroll_offset = 0;
+            }
+
+            joy_prev = j;
         }
 
         /* ============================================

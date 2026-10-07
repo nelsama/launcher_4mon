@@ -1,6 +1,6 @@
 # 🚀 APP LAUNCHER - Monitor 6502
 
-**Lanzador de aplicaciones** para el **Monitor 6502** en Tang Nano 9K. Escanea la SD Card, lista los binarios disponibles y permite seleccionarlos y ejecutarlos via **UART** o **display TM1638** con teclado.
+**Lanzador de aplicaciones** para el **Monitor 6502** en Tang Nano 9K. Escanea la SD Card, lista los binarios disponibles y permite seleccionarlos y ejecutarlos. La salida va **simultáneamente** a la terminal serie (UART), al **display HDMI** (core de vídeo) y al **display TM1638**. La entrada acepta UART, joystick Atari y los botones del TM1638.
 
 ## 🎮 Controles
 
@@ -11,6 +11,18 @@
 | `S` / `s` / `2` | Bajar en la lista |
 | `ENTER` | Cargar y ejecutar selección |
 | `Q` / `q` | Salir al monitor |
+
+### Joystick Atari (DB9)
+| Dirección / Botón | Acción |
+|-------|--------|
+| **Arriba** | Subir en la lista |
+| **Abajo** | Bajar en la lista |
+| **FIRE** | Cargar y ejecutar selección |
+| **IZQUIERDA** | Encender/apagar el display del TM1638 |
+
+El botón IZQUIERDA se añadió para **silenciar el ruido** que el módulo TM1638
+inyecta en el audio: apagado, no circula corriente por los segmentos. No afecta
+al resto de la entrada (UART y botones del TM1638 siguen funcionando).
 
 ### TM1638 Display
 | Tecla | Acción |
@@ -25,13 +37,14 @@ El display TM1638 muestra el **nombre del archivo** seleccionado (8 caracteres).
 ## ✨ Características
 
 - ✅ Escanea automáticamente la SD Card al iniciar
-- ✅ Lista hasta **60 aplicaciones** encontradas en la SD
-- ✅ Navegación por **UART** y **TM1638** simultánea
+- ✅ Lista hasta **16 aplicaciones** (límite del caché de directorio del MFS)
+- ✅ Navegación por **UART**, **joystick** y **TM1638** simultánea
 - ✅ Los binarios se cargan en `$0800` y se ejecutan automáticamente
 - ✅ **Sin límite de tamaño** para las apps (usa `rom_mfs_load_run()`)
 - ✅ Post-ejecución: reescanea la SD automáticamente
 - ✅ Display TM1638 se apaga al salir al monitor
-- ✅ Optimizado: solo redibuja líneas cambiadas (ANSI escape codes)
+- ✅ HDMI muestra la app seleccionada (modo texto del core de vídeo)
+- ✅ Display TM1638 apagable con el joystick (elimina ruido en el audio)
 - ✅ `romapi.h` sin modificar
 
 ## 📋 Flujo de Operación
@@ -53,38 +66,44 @@ Inicio → SD init → MFS mount → Leer FAT cache ($0264) → Menú interactiv
 ```
 LAUNCHER/
 ├── src/
-│   ├── main.c          # ✅ Lanzador completo (~580 líneas)
+│   ├── main.c          # ✅ Lanzador completo
+│   ├── joy.c / joy.h   # Driver del joystick Atari (Puerto 1, bits 3-7)
 │   └── startup.s       # Inicialización runtime C (CC65)
 ├── config/
 │   └── programa.cfg    # Configuración del linker
 ├── include/
 │   ├── romapi.h        # ROM API del Monitor 6502 (sin modificar)
 │   └── tm1638.h        # Compatibilidad: redirige a la librería externa
-├── lib/                # (sin librerías copiadas; el TM1638 es externo)
 ├── build/              # Objetos (generados)
 ├── output/
-│   └── LAUNCHER.bin    # ✅ Binario final (~9.9 KB)
+│   └── LAUNCHER.bin    # ✅ Binario final
 ├── makefile            # Compilación
 └── README.md           # Este documento
 ```
 
-## 📦 Librería TM1638 (referenciada, no copiada)
+No hay carpeta `lib/`: las dos librerías (TM1638 y core de vídeo) se
+**referencian** desde sus repositorios, no se copian. Ver más abajo.
 
-El driver TM1638 vive en su propio repositorio y **este proyecto solo lo
-referencia**, sin copiar código:
+## 📦 Librerías (referenciadas, no copiadas)
+
+Este proyecto **no copia código de librerías**. Ambas se referencian desde su
+propio repositorio, que se actualiza con `git pull`:
 
 ```
-D:\Proyectos\libs\tm1638-6502-cc65
-├── src/tm1638.c        # Implementación
-├── include/tm1638.h    # Header público
+D:\Proyectos\tm1638-6502-cc65            # driver del display y teclado
+├── src/tm1638.c
+├── include/tm1638.h
 └── docs/, tests/, examples/
+
+D:\Proyectos\juegos_6502\videocore-6502-cc65   # core de vídeo (modo texto)
+├── src/video.h
+├── output/vc.lib
+└── docs/, examples/
 ```
 
-El `makefile` apunta ahí con `TM1638_DIR`, compila
-`$(TM1638_DIR)\src\tm1638.c` y añade `$(TM1638_DIR)\include` a `-I`. La ruta
-está en una sola variable, cámbiala ahí si mueves la librería.
-
-**Ventajas:**
+El `makefile` apunta a ellas con `TM1638_DIR` y `VC_DIR`, y el orden de los
+`-I` importa (ver comentario en el makefile). Cambiar esas variables si las
+librerías se mueven.
 
 - Una sola copia del driver para todos los proyectos: se actualiza con
   `git pull` en el repositorio de la librería.
@@ -171,23 +190,80 @@ Usa `rom_mfs_load_run(name, 0x0800)` que carga el binario directamente en `$0800
 
 | Rango | Uso |
 |-------|-----|
-| `$0800-$312E` | Código, datos y BSS del launcher (~12 KB) |
-| `$3E00-$3FFF` | Stack CC65 (512 bytes) |
+| `$0800-$3B01` | Código, datos y BSS del launcher |
+| `$3D00-$3DFF` | Stack CC65 (256 bytes) |
 | `$BF00-$BF84` | ROM API (Jump Table) |
 | `$C000-$C0FF` | Puertos de I/O |
+
+> ⚠️ **Límite del monitor: hasta `$312E`.** El monitor reserva RAM por encima de
+> esa dirección, así que un programa que crezca más allá la pisa. Este launcher
+> **ya está por encima** pero funciona porque el monitor solo recarga el launcher
+> desde la SD, que es como se usa normalmente. Si se carga por XMODEM a `$0800`
+> puede reiniciarse. El README antiguo citaba `$312E` como fin del launcher
+> (12 KB); con el joystick y el HDMI creció a ~12.8 KB.
+>
+> El `apps[16]` (240 bytes) vive en BSS y **no debe acercarse al stack**: si el
+> código crece, el stack lo pisa y los nombres del listado se corrompen (se ve
+> solo la primera letra del último archivo). Dejar al menos ~200 bytes de
+> separación; hoy hay ~509.
+
+### Ruido en el audio
+
+El módulo QYF-TM1638 inyecta ruido en el audio, y **escala con la cantidad de
+segmentos encendidos**: más caracteres en el display, más ruido. El ruido viene
+de la corriente de los segmentos, **no** de la velocidad de conmutación.
+
+Medidas, y qué funcionó:
+
+| Medida | Resultado |
+|--------|-----------|
+| Aislamiento de pines (el driver solo toca CLK/DIO/STB) | ✅ necesario |
+| Subir `timing_delay` de 8 a 20 | ❌ mismo ruido, display más lento |
+| **Apagar el display** (`tm1638_display_off()`) | ✅ **elimina el ruido** |
+
+Por eso el botón **IZQUIERDA** del joystick alterna el display. La librería
+expone `tm1638_display_off()` / `tm1638_display_on()`, que mandan el comando
+`0x80` (Display OFF real; `set_brightness(0)` NO apaga, solo baja al mínimo).
+
+### Joystick Atari (DB9)
+
+En el Puerto 1, bits 3-7 (los 0-2 son del TM1638):
+
+| Señal | Bit | Máscara |
+|-------|-----|---------|
+| right | 3 | `0x08` |
+| left | 4 | `0x10` |
+| down | 5 | `0x20` |
+| up | 6 | `0x40` |
+| fire | 7 | `0x80` |
+
+Activo por nivel bajo (0 = pulsado), requiere pull-ups en el FPGA.
+
+> ⚠️ **El registro `$C002` se reescribe en cada vuelta del bucle.** El TM1638
+> también escribe ese registro para alternar el bit DIO, y si el FPGA no
+> devuelve por lectura lo escrito (registro write-only), su read-modify-write
+> pisa la configuración del joystick y deja de responder a los pocos segundos.
+> Llamar `joy_init()` antes de cada `joy_read()` resuelve esto.
+
+FIRE se lee **por nivel, sin detección de flanco**: `launch_app()` bloquea el
+bucle durante la carga de SD, así que el estado previo queda desincronizado y
+el flanco se pierde. Arriba/abajo sí usan flanco, para moverse de a un paso.
 
 ## 🛠️ Hardware Requerido
 
 - **Tang Nano 9K** con Monitor 6502 v2.2.0+ y ROM API
 - **SD Card** para almacenar las aplicaciones
 - **Display TM1638** (8 dígitos + 16 teclas) conectado al puerto `0xC000`
+- **Joystick Atari (DB9)** en el Puerto 1, bits 3-7
 - **Cable UART** para terminal serial
+- **Salida HDMI** (core de vídeo) para el menú
 
 ## ⚠️ Notas
 
 - La SD debe estar formateada con **MFS** (MicroFS), el sistema de archivos del Monitor 6502
 - Los binarios deben ser ejecutables desde `$0800` (formato estándar del monitor)
 - `romapi.h` **no ha sido modificado** — se usa tal cual
+- Máximo **16 aplicaciones**: es el límite del caché de directorio del MFS
 - Para agregar más librerías, ver `include/romapi.h` para la ROM API
 - El driver TM1638 **no se copia** en este proyecto: se referencia desde
   `D:\Proyectos\libs\tm1638-6502-cc65` (ver sección Librería TM1638)
