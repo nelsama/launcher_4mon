@@ -105,6 +105,13 @@ El `makefile` apunta a ellas con `TM1638_DIR` y `VC_DIR`, y el orden de los
 `-I` importa (ver comentario en el makefile). Cambiar esas variables si las
 librerías se mueven.
 
+## 📚 Documentación
+
+| Documento | Contenido |
+|-----------|-----------|
+| Este README | Uso, controles y detalles técnicos del launcher |
+| [`docs/EFECTO-BORROSO-PALETAS.md`](docs/EFECTO-BORROSO-PALETAS.md) | Por qué una paleta de bajo contraste hace que el texto se vea borroso, y cómo usar ese efecto a propósito (fundidos, translucidez, antialiasing) |
+
 - Una sola copia del driver para todos los proyectos: se actualiza con
   `git pull` en el repositorio de la librería.
 - El repositorio de la librería trae `docs/`, `examples/` y un banco de
