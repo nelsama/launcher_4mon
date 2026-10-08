@@ -445,9 +445,36 @@ void quit_to_monitor(void) {
 #define SCR_HINT_ROW     15
 #define SCR_MSG_ROW      22
 
-/* Paletas del menu (del core de video) */
-#define PAL_NORMAL       VC_BGPAL_0     /* texto normal */
-#define PAL_SELECTED     VC_BGPAL_2     /* app seleccionada (resaltada) */
+/* Paletas del menu (del core de video).
+ *
+ * La fuente de texto del core pinta SIEMPRE el color 3 de la paleta (la
+ * "tinta"), asi que el color de la letra lo decide la paleta de la celda, no
+ * un indice de color.
+ *
+ * PAL_NORMAL usa el preset de BGPAL_0: letra blanca sobre fondo azul.
+ * PAL_SELECTED usa BGPAL_1, pero sus colores se REDEFINEN al arrancar
+ * (ver setup_menu_palettes) para que la letra salga VERDE y el fondo se
+ * distinga. El preset de BGPAL_1 (marron/gris/blanco) no se usa.
+ *
+ * No usar BGPAL_2 para el resaltado: su color 3 es verde igual que su fondo,
+ * y el nombre se ve borroso por falta de contraste. */
+#define PAL_NORMAL       VC_BGPAL_0     /* letra blanca, fondo azul */
+#define PAL_SELECTED     VC_BGPAL_1     /* letra verde, fondo oscuro */
+
+/* Colores de la paleta de seleccion (RGB444, un nibble por canal 0-15). */
+#define SEL_BG   VC_RGB444(0, 0, 5)     /* fondo: azul muy oscuro */
+#define SEL_INK  VC_RGB444(0, 15, 0)    /* tinta: verde puro */
+
+/**
+ * @brief Redefine la paleta del resaltado (letra verde sobre fondo oscuro).
+ *
+ * El color 1 es el fondo de la celda y el 3 la tinta de la fuente. Se dejan
+ * los otros dos como estan por si algun tile los usa.
+ */
+static void setup_menu_palettes(void) {
+    vc_pal_set_bg(PAL_SELECTED, 1, SEL_BG);
+    vc_pal_set_bg(PAL_SELECTED, 3, SEL_INK);
+}
 
 /**
  * @brief Muestra en pantalla SOLO la app seleccionada.
@@ -650,10 +677,23 @@ int main(void) {
      * ============================================ */
 
     /* Inicializar la salida HDMI (modo texto del core de video).
-     * Espera a VIDEO_READY y limpia la pantalla. La UART ya la deja lista
-     * el monitor, no necesita inicializacion aqui. */
+     * Espera a VIDEO_READY, limpia la pantalla y fija el color de fondo.
+     * La UART ya la deja lista el monitor, no necesita inicializacion aqui. */
     vc_wait_ready();
     vc_text_init();
+
+    /* Color de fondo global (BG_COLOR).
+     *
+     * El fondo de las celdas vacias es transparente (color 0), asi que deja
+     * ver esta entrada de paleta. NO se inicializa sola: sin fijarla, el
+     * fondo queda en lo que el core tenga por defecto (negro o basura).
+     *
+     * Al agotar la paleta 3 (comparte entrada 15, ver manual del core), este
+     * color tambien es el color 3 de esa paleta. */
+    vc_set_bgcolor(VC_BG_COLOR_DEFAULT);
+
+    /* Redefinir la paleta del resaltado del menu (letra verde, fondo oscuro) */
+    setup_menu_palettes();
 
     /* No hay banner ni mensajes de arranque: el menu HDMI y el listado UART
      * ya informan del estado, y cada linea costaba ROM. */

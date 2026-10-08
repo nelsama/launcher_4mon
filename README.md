@@ -207,6 +207,33 @@ Usa `rom_mfs_load_run(name, 0x0800)` que carga el binario directamente en `$0800
 > solo la primera letra del último archivo). Dejar al menos ~200 bytes de
 > separación; hoy hay ~509.
 
+### Colores del menú HDMI
+
+El fondo de las celdas vacías es **transparente** (color 0), así que deja ver la
+entrada **BG_COLOR** de la paleta. No se inicializa sola: hay que llamar
+`vc_set_bgcolor(VC_BG_COLOR_DEFAULT)` al arrancar, o el fondo queda en lo que el
+core tenga por defecto.
+
+La fuente de texto del core **pinta siempre el color 3 de la paleta** (la
+"tinta"), nunca un índice de color suelto. O sea: el color de la letra lo decide
+la paleta de la celda. De ahí dos cosas:
+
+- `PAL_NORMAL` = `VC_BGPAL_0` → letra blanca sobre fondo azul (preset)
+- `PAL_SELECTED` = `VC_BGPAL_1`, **con colores redefinidos** al arrancar:
+  color 1 (fondo) azul oscuro, color 3 (tinta) verde
+
+```c
+#define SEL_BG   VC_RGB444(0, 0, 5)    /* fondo: azul muy oscuro */
+#define SEL_INK  VC_RGB444(0, 15, 0)   /* tinta: verde puro */
+```
+
+> ⚠️ **No usar `VC_BGPAL_2` para texto.** Su color 3 es verde, igual que su
+> fondo: el texto sale verde sobre verde y se ve borroso. Se probó y se
+descartó; las paletas preseleccionadas no garantizan contraste entre tinta y
+> fondo.
+
+`VC_RGB444(r, g, b)` usa un nibble por canal (0-15), no 0-255.
+
 ### Ruido en el audio
 
 El módulo QYF-TM1638 inyecta ruido en el audio, y **escala con la cantidad de
