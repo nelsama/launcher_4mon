@@ -30,7 +30,7 @@ OUTPUT_DIR = output
 # Libreria TM1638: repositorio externo referenciado, NO copiado.
 # Comparte el codigo con otros proyectos; se actualiza con 'git pull'.
 # Ajustar aqui si la libreria cambia de ubicacion.
-TM1638_DIR = D:\Proyectos\tm1638-6502-cc65
+TM1638_DIR = D:\Proyectos\libs\tm1638-6502-cc65
 
 # Libreria del Core de Video (modo texto en HDMI). Tambien referenciada.
 # Solo se enlazan los objetos que el launcher usa: no hay que sumar vc.lib

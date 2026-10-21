@@ -122,6 +122,15 @@
 #define ROMAPI_DELAY_US         0xBF30
 #define ROMAPI_DELAY_MS         0xBF33
 
+/* --- Registro de flags del sistema (hardware) --- */
+/* $C004 bit 0: flag persistente al reset de CPU (S1 y reset por software).
+ *   bit 0 = 1 -> el monitor NO ejecuta BOOT.INI
+ *   bit 0 = 0 -> el monitor SI ejecuta BOOT.INI
+ * Solo se pierde al recargar el bitstream. Ver fpga-6502-16k:
+ * docs/03-FORMATOS-Y-MEMORIA.md, seccion 5.5. */
+#define SYSFLAGS                (*(volatile unsigned char *)0xC004)
+#define SYSFLAG_NOBOOT          0x01
+
 /* --- SPI --- */
 #define ROMAPI_SPI_INIT         0xBF48
 #define ROMAPI_SPI_SELECT       0xBF4B

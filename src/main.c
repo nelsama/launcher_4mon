@@ -397,6 +397,14 @@ void quit_to_monitor(void) {
     tm1638_clear_display();
     uart_print("\r\nVolviendo al monitor...\r\n");
     rom_delay_ms(200);
+
+    /* Pedir al monitor que NO ejecute BOOT.INI al entrar en $8000.
+     * Sin esto el monitor ve el flag a 0, relanza el autoboot y
+     * recarga el launcher: bucle infinito. Con el flag a 1 el usuario
+     * llega al prompt y desde ahi puede usar QB para volver.
+     * $C004 es un FF del FPGA fuera del dominio de reset. */
+    SYSFLAGS = SYSFLAG_NOBOOT;
+
     ((void (*)(void))0x8000)();
 }
 
