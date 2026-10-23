@@ -143,31 +143,42 @@ static void uart_put_line(const char *s) {
     uart_print("\r\n");
 }
 
-void uart_print_num16(uint16_t n) {
-    char buf[6];
-    uint8_t i = 0;
-    uint8_t j;
-    char tmp;
+/*
+ * Conversion decimal compartida por las dos salidas (UART y pantalla).
+ *
+ * Antes cada una tenia su propio bucle de /10 y %10, con el mismo codigo
+ * duplicado. Aqui se convierte una sola vez y cada salida solo escribe.
+ *
+ * Devuelve la longitud y deja los digitos en 'buf', del menos significativo
+ * al mas (al reves), que es como salen del bucle de division.
+ */
+static uint8_t num_to_dec(uint16_t n, char *buf) {
+    uint8_t len = 0;
 
     if (n == 0) {
-        rom_uart_putc('0');
-        return;
+        buf[len] = '0';
+        return 1;
     }
 
-    while (n > 0) {
-        buf[i++] = (n % 10) + '0';
+    while (n > 0 && len < 5) {
+        buf[len] = (char)('0' + (n % 10));
         n /= 10;
+        len++;
     }
 
-    /* Invertir */
-    for (j = 0; j < i / 2; j++) {
-        tmp = buf[j];
-        buf[j] = buf[i - 1 - j];
-        buf[i - 1 - j] = tmp;
-    }
+    return len;
+}
 
-    for (j = 0; j < i; j++) {
-        rom_uart_putc(buf[j]);
+void uart_print_num16(uint16_t n) {
+    char buf[6];
+    uint8_t len;
+    uint8_t i;
+
+    len = num_to_dec(n, buf);
+
+    /* buf esta al reves: emitir del ultimo al primero */
+    for (i = 0; i < len; i++) {
+        rom_uart_putc(buf[len - 1 - i]);
     }
 }
 
@@ -263,20 +274,11 @@ static void put_padded(uint8_t col, uint8_t row, const char *s,
 static void put_num(uint8_t col, uint8_t row, uint16_t n,
                     uint8_t width, uint8_t paleta) {
     char buf[6];
-    uint8_t len = 0;
+    uint8_t len;
     uint8_t i;
     uint8_t pad;
 
-    if (n == 0) {
-        buf[len] = '0';
-        len++;
-    } else {
-        while (n > 0 && len < 5) {
-            buf[len] = (char)('0' + (n % 10));
-            n /= 10;
-            len++;
-        }
-    }
+    len = num_to_dec(n, buf);
 
     pad = (width > len) ? (width - len) : 0;
     for (i = 0; i < pad; i++) {
@@ -444,14 +446,17 @@ void quit_to_monitor(void) {
  * La zona de mensajes empieza por debajo de todo lo anterior para que
  * console_print (que avanza fila a fila) no pise el menu. launch_app vuelve
  * el cursor a SCR_MSG_ROW antes de escribir. */
-#define SCR_TITLE_ROW    0
-#define SCR_SEP1_ROW     1
+#define SCR_TITLE_ROW    1
+#define SCR_SEP1_ROW     2
 #define SCR_LABEL_ROW    6
-#define SCR_NAME_ROW     8
-#define SCR_SEP2_ROW     11
-#define SCR_INFO_ROW     13
-#define SCR_HINT_ROW     15
-#define SCR_MSG_ROW      22
+#define SCR_NAME_ROW     9
+#define SCR_BOX_TOP      8
+#define SCR_BOX_BOT      10
+#define SCR_SEP2_ROW     13
+#define SCR_INFO_ROW     15
+#define SCR_HINT_ROW     17
+#define SCR_SEP3_ROW     21
+#define SCR_MSG_ROW      23
 
 /* Paletas del menu (del core de video).
  *
@@ -459,68 +464,134 @@ void quit_to_monitor(void) {
  * "tinta"), asi que el color de la letra lo decide la paleta de la celda, no
  * un indice de color.
  *
- * PAL_NORMAL usa el preset de BGPAL_0: letra blanca sobre fondo azul.
- * PAL_SELECTED usa BGPAL_1, pero sus colores se REDEFINEN al arrancar
- * (ver setup_menu_palettes) para que la letra salga VERDE y el fondo se
- * distinga. El preset de BGPAL_1 (marron/gris/blanco) no se usa.
+ * Tema "azul noche": fondo casi negro, texto gris claro y el nombre
+ * seleccionado en verde brillante.
  *
  * No usar BGPAL_2 para el resaltado: su color 3 es verde igual que su fondo,
  * y el nombre se ve borroso por falta de contraste. */
-#define PAL_NORMAL       VC_BGPAL_0     /* letra blanca, fondo azul */
-#define PAL_SELECTED     VC_BGPAL_1     /* letra verde, fondo oscuro */
+#define PAL_NORMAL       VC_BGPAL_0     /* titulo, marcos y texto: gris claro */
+#define PAL_SELECTED     VC_BGPAL_1     /* nombre verde brillante */
 
-/* Colores de la paleta de seleccion (RGB444, un nibble por canal 0-15). */
-#define SEL_BG   VC_RGB444(0, 0, 5)     /* fondo: azul muy oscuro */
-#define SEL_INK  VC_RGB444(0, 15, 0)    /* tinta: verde puro */
+/* Colores del tema "azul noche" (RGB444: un nibble por canal 0-15).
+ * VC_RGB444(0,0,2) equivale a #000020 en RGB888. */
+#define THEME_BG     VC_RGB444(0, 0, 2)     /* fondo general, azul casi negro */
+#define THEME_TEXT   VC_RGB444(12, 12, 12)  /* texto, titulo y marcos: gris claro */
+#define THEME_SEL_FG VC_RGB444(4, 15, 4)    /* seleccion: verde brillante */
 
 /**
- * @brief Redefine la paleta del resaltado (letra verde sobre fondo oscuro).
+ * @brief Fija las paletas del menu (solo las 0 y 1).
  *
- * El color 1 es el fondo de la celda y el 3 la tinta de la fuente. Se dejan
- * los otros dos como estan por si algun tile los usa.
+ * AVISO: BG_COLOR ocupa la entrada 15 del banco de fondo, que comparten
+ * paleta 3 / color 3. Por eso NO se puede usar VC_BGPAL_3 para nada visible:
+ * vc_set_bgcolor() pisaria su color y el texto de esa paleta se volveria
+ * invisible (tomaria el color del fondo).
+ *
+ * Con solo dos paletas quedan tres colores: fondo, gris claro y verde. Los
+ * marcos se distinguen por su FORMA (+---+, ====), no por el color.
+ *
+ * Tambien se fijan explicitamente y no se confia en los presets del core: la
+ * paleta sobrevive al reset, asi que un programa anterior podria haberla
+ * redefinido.
  */
 static void setup_menu_palettes(void) {
-    vc_pal_set_bg(PAL_SELECTED, 1, SEL_BG);
-    vc_pal_set_bg(PAL_SELECTED, 3, SEL_INK);
+    /* Fondo global: lo que se ve en las celdas vacias (color 0 transparente) */
+    vc_set_bgcolor(THEME_BG);
+
+    /* Paleta 0: texto, titulo y marcos (fondo del tema, tinta gris claro) */
+    vc_pal_set_bg(PAL_NORMAL, 1, THEME_BG);
+    vc_pal_set_bg(PAL_NORMAL, 3, THEME_TEXT);
+
+    /* Paleta 1: nombre seleccionado (mismo fondo, tinta verde) */
+    vc_pal_set_bg(PAL_SELECTED, 1, THEME_BG);
+    vc_pal_set_bg(PAL_SELECTED, 3, THEME_SEL_FG);
 }
 
 /**
  * @brief Muestra en pantalla SOLO la app seleccionada.
+ *
+ * Layout de 40x30 con marcos ASCII: la fuente del core solo dibuja los
+ * caracteres $20-$7F, asi que los marcos se hacen con + - | y la barra de
+ * posicion con [ # . ], no con caracteres de bloque (no existen en la fuente).
+ *
+ *   fila  0         ==============================================
+ *   fila  1            APP LAUNCHER - MONITOR 6502      (centrado)
+ *   fila  2         ==============================================
+ *   fila  6                   SELECCIONADA
+ *   filas 8..10     +----------------------------+
+ *                   |        NOMBRE.BIN          |      (recuadro)
+ *                   +----------------------------+
+ *   fila 13         ----------------------------------------------
+ *   fila 15              [########......]   1/7          (barra)
+ *   fila 17         ----------------------------------------------
+ *   fila 18           K1/K2 o W/S     navegar
+ *   fila 19           FIRE o ENTER    cargar
+ *   fila 21         ==============================================
  *
  * Idempotente y sin estado: cada llamada deja la pantalla en el estado
  * correcto, asi que la navegacion no necesita recordar que cambio.
  */
 static void screen_show_selected(app_entry_t* apps, uint8_t count,
                                  uint8_t selected) {
-    put_padded(0, SCR_TITLE_ROW, "  APP LAUNCHER - Monitor 6502",
-                       VC_SCREEN_COLS, PAL_NORMAL);
-    put_padded(0, SCR_SEP1_ROW, SEP_DA, VC_SCREEN_COLS, PAL_NORMAL);
+    /* Marco superior con el titulo centrado.
+     * Las lineas se centran con la COLUMNA del put_padded, no con espacios
+     * dentro de la cadena: los espacios literales ocupaban RODATA y aqui
+     * cada byte cuenta.
+     *
+     /* Colores: todo el texto y los marcos en gris claro (PAL_NORMAL, paleta 0)
+     * y el nombre seleccionado en verde (PAL_SELECTED, paleta 1).
+     * No se usa VC_BGPAL_3: su color 3 comparte entrada con BG_COLOR. */
+    put_padded(0, SCR_TITLE_ROW - 1, SEP_EQ, VC_SCREEN_COLS, PAL_NORMAL);
+    put_padded(6, SCR_TITLE_ROW, "APP LAUNCHER - MONITOR 6502",
+                       VC_SCREEN_COLS - 6, PAL_NORMAL);
+    put_padded(0, SCR_SEP1_ROW, SEP_EQ, VC_SCREEN_COLS, PAL_NORMAL);
 
-    put_padded(0, SCR_LABEL_ROW, "  SELECCIONADA:",
-                       VC_SCREEN_COLS, PAL_NORMAL);
+    put_padded(14, SCR_LABEL_ROW, "SELECCIONADA",
+                       VC_SCREEN_COLS - 14, PAL_NORMAL);
 
-    /* Nombre con sangria, resaltado por paleta */
-    put_padded(0, SCR_NAME_ROW, "   ", 3, PAL_SELECTED);
-    put_padded(3, SCR_NAME_ROW, apps[selected].name,
-                       VC_SCREEN_COLS - 3, PAL_SELECTED);
+    /* Recuadro alrededor del nombre seleccionado (28 columnas, col 6).
+     * El borde va en gris (PAL_NORMAL) y el nombre en verde (PAL_SELECTED). */
+    put_padded(6, SCR_BOX_TOP, "+--------------------------+",
+                       VC_SCREEN_COLS - 6, PAL_NORMAL);
+    put_padded(6, SCR_NAME_ROW, "| ", 2, PAL_NORMAL);
+    put_padded(8, SCR_NAME_ROW, apps[selected].name, 24, PAL_SELECTED);
+    put_padded(32, SCR_NAME_ROW, " |", 2, PAL_NORMAL);
+    put_padded(6, SCR_BOX_BOT, "+--------------------------+",
+                       VC_SCREEN_COLS - 6, PAL_NORMAL);
 
     put_padded(0, SCR_SEP2_ROW, SEP_DA, VC_SCREEN_COLS, PAL_NORMAL);
 
-    /* Posicion en la lista */
-    put_padded(0, SCR_INFO_ROW, " App", 4, PAL_NORMAL);
-    put_num(4, SCR_INFO_ROW, selected + 1, 3, PAL_NORMAL);
-    put_padded(7, SCR_INFO_ROW, "/", 1, PAL_NORMAL);
-    put_num(8, SCR_INFO_ROW, count, 3, PAL_NORMAL);
+    /* Barra de posicion: 20 celdas y "N/M" al lado. Empieza en la col 9,
+     * centrada: 9 + 1 + 20 + 1 = 31 espacio para el numero. */
+    {
+        uint8_t llenas;
+        uint8_t i;
 
-    /* Instrucciones: navegar y ejecutar. Se separan en dos lineas para no
-     * pasar de 40 columnas (41+ hace que la pantalla envuelva). */
-    put_padded(0, SCR_HINT_ROW, "  W/S o K1/K2 = Navegar",
-                       VC_SCREEN_COLS, PAL_NORMAL);
-    put_padded(0, SCR_HINT_ROW + 1, "  ENTER o K8   = Cargar y ejecutar",
-                       VC_SCREEN_COLS, PAL_NORMAL);
+        /* cuantas celdas llenas: 1..20 segun la posicion */
+        llenas = (uint8_t)(((uint16_t)(selected + 1) * 20) / count);
+        if (llenas == 0) llenas = 1;
 
-    /* Limpiar la zona de mensajes: al navegar debe quedar vacia.
-     * Una sola llamada basta: con ancho VC_SCREEN_COLS limpia la fila entera. */
+        put_padded(9, SCR_INFO_ROW, "[", 1, PAL_NORMAL);
+        for (i = 0; i < 20; i++) {
+            vc_put_cell(10 + i, SCR_INFO_ROW, (uint8_t)((i < llenas) ? '#' : '.'));
+            vc_set_cell_attr(10 + i, SCR_INFO_ROW, PAL_NORMAL, 0);
+        }
+        put_padded(30, SCR_INFO_ROW, "]", 1, PAL_NORMAL);
+        put_num(33, SCR_INFO_ROW, selected + 1, 2, PAL_NORMAL);
+        put_padded(35, SCR_INFO_ROW, "/", 1, PAL_NORMAL);
+        put_num(36, SCR_INFO_ROW, count, 2, PAL_NORMAL);
+    }
+
+    put_padded(0, SCR_HINT_ROW - 1, SEP_DA, VC_SCREEN_COLS, PAL_NORMAL);
+
+    /* Instrucciones centradas (col 9) */
+    put_padded(9, SCR_HINT_ROW, "K1/K2 o W/S    navegar",
+                       VC_SCREEN_COLS - 9, PAL_NORMAL);
+    put_padded(9, SCR_HINT_ROW + 1, "FIRE o ENTER   cargar",
+                       VC_SCREEN_COLS - 9, PAL_NORMAL);
+
+    put_padded(0, SCR_SEP3_ROW, SEP_EQ, VC_SCREEN_COLS, PAL_NORMAL);
+
+    /* Limpiar la zona de mensajes: al navegar debe quedar vacia. */
     put_padded(0, SCR_MSG_ROW, "", VC_SCREEN_COLS, PAL_NORMAL);
     put_padded(0, SCR_MSG_ROW + 1, "", VC_SCREEN_COLS, PAL_NORMAL);
 }
@@ -690,17 +761,11 @@ int main(void) {
     vc_wait_ready();
     vc_text_init();
 
-    /* Color de fondo global (BG_COLOR).
+    /* Fijar TODAS las paletas y el color de fondo del menu.
      *
-     * El fondo de las celdas vacias es transparente (color 0), asi que deja
-     * ver esta entrada de paleta. NO se inicializa sola: sin fijarla, el
-     * fondo queda en lo que el core tenga por defecto (negro o basura).
-     *
-     * Al agotar la paleta 3 (comparte entrada 15, ver manual del core), este
-     * color tambien es el color 3 de esa paleta. */
-    vc_set_bgcolor(VC_BG_COLOR_DEFAULT);
-
-    /* Redefinir la paleta del resaltado del menu (letra verde, fondo oscuro) */
+     * La paleta sobrevive al reset del CPU: si antes corrio un programa que
+     * la redefinio, el menu heredaria sus colores. Por eso no se confia en
+     * los presets del core y se fijan aqui todas las entradas usadas. */
     setup_menu_palettes();
 
     /* No hay banner ni mensajes de arranque: el menu HDMI y el listado UART
